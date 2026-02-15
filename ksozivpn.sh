@@ -1,39 +1,37 @@
 #!/bin/bash
-# ZIVPN UDP Server + Web UI (Myanmar) - Clean & Optimized
-# Author: Zahid Islam + KSO polish
+# ZIVPN UDP Server + Web UI (KSO Polish) - Manual Renew & Online Check
+# Features: Manual Renew (Admin Input), Online User Check, No Auto-Delete
 
 set -euo pipefail
 
-# ===== Colors & UI =====
+# ===== Styling =====
 B="\e[1;34m"; G="\e[1;32m"; Y="\e[1;33m"; R="\e[1;31m"; C="\e[1;36m"; Z="\e[0m"
 LINE="${B}────────────────────────────────────────────────────────${Z}"
-say(){ echo -e "$1"; }
 
-echo -e "\n$LINE\n${G}🌟 ZIVPN UDP-KSO (Cleaned Version)${Z}\n$LINE"
+echo -e "\n$LINE\n${G}🌟 ZIVPN UDP-KSO (Manual Renew & Online Version)${Z}\n$LINE"
 
 # Root check
 if [ "$(id -u)" -ne 0 ]; then
-  echo -e "${R}ဤ script ကို root အဖြစ် run ရပါမယ် (sudo -i)${Z}"; exit 1
+  echo -e "${R}Error: Please run as root (sudo -i)${Z}"; exit 1
 fi
 
 export DEBIAN_FRONTEND=noninteractive
 
-# ===== 1. Packages Install =====
-say "${Y}📦 လိုအပ်သော Packages များတင်နေသည်...${Z}"
+# ===== Dependencies =====
 apt-get update -y >/dev/null
-apt-get install -y curl ufw jq python3 python3-flask iproute2 conntrack openssl ca-certificates >/dev/null
+apt-get install -y curl ufw jq python3 python3-flask iproute2 conntrack ca-certificates openssl >/dev/null
 
 # Stop old services
 systemctl stop zivpn.service zivpn-web.service 2>/dev/null || true
 
-# ===== 2. Folders & Binary =====
+# ===== Setup Directories =====
 mkdir -p /etc/zivpn
 BIN="/usr/local/bin/zivpn"
 CFG="/etc/zivpn/config.json"
 USERS="/etc/zivpn/users.json"
 ENVF="/etc/zivpn/web.env"
 
-say "${Y}⬇️ ZIVPN binary ဒေါင်းလုဒ်ဆွဲနေသည်...${Z}"
+# Download Binary
 curl -fsSL -o "$BIN" "https://github.com/zahidbd2/udp-zivpn/releases/latest/download/udp-zivpn-linux-amd64"
 chmod +x "$BIN"
 
@@ -44,229 +42,216 @@ if [ ! -f /etc/zivpn/zivpn.crt ]; then
     -keyout "/etc/zivpn/zivpn.key" -out "/etc/zivpn/zivpn.crt" >/dev/null 2>&1
 fi
 
-# ===== 3. Web Admin Credentials =====
-say "${Y}🔒 Web Admin Login သတ်မှတ်ပါ${Z}"
-read -r -p "Admin Username: " WEB_USER
-if [ -n "$WEB_USER" ]; then
+# Initial Web Credentials
+if [ ! -f "$ENVF" ]; then
+  read -r -p "Admin Username (Enter=admin): " WEB_USER
+  WEB_USER=${WEB_USER:-admin}
   read -r -s -p "Admin Password: " WEB_PASS; echo
   WEB_SECRET=$(openssl rand -hex 16)
-  {
-    echo "WEB_ADMIN_USER=$WEB_USER"
-    echo "WEB_ADMIN_PASSWORD=$WEB_PASS"
-    echo "WEB_SECRET=$WEB_SECRET"
-  } > "$ENVF"
-  chmod 600 "$ENVF"
-  say "${G}✅ Web Login UI ဖွင့်ထားသည်${Z}"
-else
-  rm -f "$ENVF" 2>/dev/null || true
-  say "${Y}ℹ️ Web Admin ကို default (no login) ဖြင့်သွားမည်${Z}"
+  cat > "$ENVF" <<EOF
+WEB_ADMIN_USER=$WEB_USER
+WEB_ADMIN_PASSWORD=$WEB_PASS
+WEB_SECRET=$WEB_SECRET
+EOF
 fi
 
-# ===== 4. Web UI Script (web.py) =====
-say "${Y}📝 Web UI ဖိုင်များကို ဖန်တီးနေသည်...${Z}"
-cat > /etc/zivpn/web.py << 'PY'
-from flask import Flask, jsonify, render_template_string, request, redirect, url_for, session, make_response
-import json, re, subprocess, os, tempfile, hmac
+# Initial Config
+if [ ! -f "$USERS" ]; then echo "[]" > "$USERS"; fi
+
+# ===== Web Panel Script (Python) =====
+cat >/etc/zivpn/web.py <<'PY'
+import os, json, subprocess
+from flask import Flask, render_template_string, request, redirect, url_for, session
 from datetime import datetime, timedelta
 
+app = Flask(__name__)
+app.secret_key = os.environ.get("WEB_SECRET", "secret")
 USERS_FILE = "/etc/zivpn/users.json"
 CONFIG_FILE = "/etc/zivpn/config.json"
-LOGO_URL = "https://raw.githubusercontent.com/KYAWSOEOO8/kso-script/main/icon.png"
 
-HTML = """<!doctype html>
-<html lang="my"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
-<style>
- :root{ --bg:#f0f2f5; --fg:#1e293b; --primary:#2563eb; --ok:#10b981; --bad:#ef4444; --card:#ffffff; --bd:#e2e8f0; --muted:#64748b; }
- body{ background:var(--bg); color:var(--fg); font-family:'Segoe UI',sans-serif; margin:0; padding:15px; display:flex; flex-direction:column; align-items:center; }
- .card{ background:var(--card); border-radius:20px; padding:20px; width:100%; max-width:400px; box-shadow:0 10px 25px rgba(0,0,0,0.05); margin-bottom:15px; }
- header{ text-align:center; margin-bottom:20px; }
- .logo{ width:70px; border-radius:20px; margin-bottom:10px; border:2px solid #fff; }
- .btn-primary{ background:var(--primary); color:#fff; border:none; width:100%; padding:12px; border-radius:12px; font-weight:800; cursor:pointer; display:flex; justify-content:center; align-items:center; gap:8px; }
- table{ width:100%; border-collapse:collapse; }
- td{ padding:12px; border-bottom:1px solid var(--bd); }
- .status-dot{ width:10px; height:10px; border-radius:50%; display:inline-block; margin-right:5px; }
- #receipt{ position:fixed; left:-9999px; width:300px; background:#fff; padding:20px; text-align:center; border-radius:15px; }
-</style></head><body>
-
-{% if not authed %}
-  <div class="card" style="margin-top:50px; text-align:center;">
-    <img src="{{logo}}" class="logo"><h2>ADMIN LOGIN</h2>
-    <form method="post" action="/login">
-      <input name="u" placeholder="Username" style="width:100%; padding:10px; margin-bottom:10px; border-radius:8px; border:1px solid var(--bd);">
-      <input name="p" type="password" placeholder="Password" style="width:100%; padding:10px; margin-bottom:15px; border-radius:8px; border:1px solid var(--bd);">
-      <button class="btn-primary">LOGIN</button>
-    </form>
-  </div>
-{% else %}
-  <header><img src="{{logo}}" class="logo"><h1>KSO VIP PANEL</h1>
-    <div style="display:flex; gap:10px; justify-content:center;">
-      <a href="https://m.me/kyawsoe.oo.1292019" target="_blank" style="text-decoration:none; color:var(--primary); font-weight:bold;"><i class="fa-brands fa-facebook-messenger"></i> Messenger</a>
-      <a href="/logout" style="text-decoration:none; color:var(--bad); font-weight:bold;">Logout</a>
+HTML_TPL = """
+<!DOCTYPE html>
+<html lang="my">
+<head>
+    <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>KSO PANEL</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        body { font-family: sans-serif; background: #f0f2f5; padding: 15px; color: #333; }
+        .card { background: #fff; padding: 20px; border-radius: 15px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); width: 100%; max-width: 450px; margin: auto; margin-bottom: 20px; }
+        input { width: 100%; padding: 10px; margin: 8px 0; border: 1px solid #ddd; border-radius: 8px; box-sizing: border-box; }
+        .btn { background: #2563eb; color: #fff; border: none; padding: 10px; border-radius: 8px; cursor: pointer; font-weight: bold; width: 100%; }
+        .user-row { display: flex; justify-content: space-between; align-items: center; padding: 12px; border-bottom: 1px solid #eee; }
+        .status-online { color: #10b981; font-weight: bold; font-size: 12px; }
+        .status-expired { color: #ef4444; font-weight: bold; font-size: 12px; }
+        .renew-input { width: 60px; padding: 5px; text-align: center; margin-right: 5px; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2 style="text-align:center;">KSO VIP PANEL</h2>
+        {% if not authed %}
+        <form method="POST" action="/login">
+            <input name="u" placeholder="Username" required>
+            <input name="p" type="password" placeholder="Password" required>
+            <button class="btn">LOGIN</button>
+        </form>
+        {% else %}
+        <form method="POST" action="/add">
+            <input name="user" placeholder="နာမည်" required>
+            <input name="pass" placeholder="Password" required>
+            <input name="days" placeholder="ရက်ပေါင်း (ဥပမာ-30)" type="number" required>
+            <button class="btn">ADD USER</button>
+        </form>
+        <hr>
+        <p style="font-weight:bold;">စုစုပေါင်း User: {{ users|length }} ယောက်</p>
+        {% for u in users %}
+        <div class="user-row">
+            <div>
+                <strong>{{ u.user }}</strong> <small>(Pw: {{ u.password }})</small><br>
+                <small>ကုန်မည့်ရက်: {{ u.expires }}</small>
+                {% if u.is_expired %}
+                    <br><span class="status-expired">သက်တမ်းကုန်ပြီ</span>
+                {% endif %}
+            </div>
+            <div style="display:flex; align-items:center;">
+                <form method="POST" action="/renew" style="display:flex; align-items:center;">
+                    <input type="hidden" name="user" value="{{ u.user }}">
+                    <input name="renew_days" class="renew-input" placeholder="ရက်" type="number" value="30">
+                    <button title="Renew" style="color:#2563eb; background:none; border:none; cursor:pointer;"><i class="fa-solid fa-calendar-plus fa-lg"></i></button>
+                </form>
+                <form method="POST" action="/delete" style="margin-left:10px;">
+                    <input type="hidden" name="user" value="{{ u.user }}">
+                    <button onclick="return confirm('ဖျက်မှာလား?')" style="color:red; background:none; border:none; cursor:pointer;"><i class="fa-solid fa-trash fa-lg"></i></button>
+                </form>
+            </div>
+        </div>
+        {% endfor %}
+        <br><center><a href="/logout" style="color:#666; text-decoration:none;">Logout</a></center>
+        {% endif %}
     </div>
-  </header>
-
-  <form method="post" action="/add" id="userForm" class="card">
-    <label>နာမည်</label><input id="inUser" name="user" required style="width:100%; padding:8px; margin-bottom:10px;">
-    <label>စကားဝှက်</label><input id="inPass" name="password" required style="width:100%; padding:8px; margin-bottom:10px;">
-    <label>ရက်ပေါင်း</label><input id="inDays" name="expires" placeholder="30" style="width:100%; padding:8px; margin-bottom:15px;">
-    <button type="button" onclick="handleSave()" class="btn-primary">SAVE & DOWNLOAD <i class="fa-solid fa-download"></i></button>
-  </form>
-
-  <div class="card">
-    <table>
-      {% for u in users %}
-      <tr>
-        <td><strong>{{u.user}}</strong><br><small>{{u.expires}}</small></td>
-        <td style="text-align:right;">
-          <form method="post" action="/delete" onsubmit="return confirm('ဖျက်မှာသေချာလား?')">
-            <input type="hidden" name="user" value="{{u.user}}">
-            <button style="background:none; border:none; color:var(--bad); cursor:pointer;"><i class="fa-solid fa-trash"></i></button>
-          </form>
-        </td>
-      </tr>
-      {% endfor %}
-    </table>
-  </div>
-
-  <div id="receipt">
-    <h3 style="color:var(--primary);">KSO VIP</h3>
-    <p>User: <span id="rU"></span></p>
-    <p>Pass: <span id="rP"></span></p>
-    <p>Exp: <span id="rE"></span></p>
-  </div>
-
-  <script>
-    function handleSave(){
-      const u=document.getElementById('inUser').value;
-      const p=document.getElementById('inPass').value;
-      const d=document.getElementById('inDays').value || "30";
-      if(!u || !p) return alert("ဖြည့်ပါ");
-      document.getElementById('rU').innerText=u;
-      document.getElementById('rP').innerText=p;
-      const date = new Date(); date.setDate(date.getDate() + parseInt(d));
-      document.getElementById('rE').innerText=date.toISOString().split('T')[0];
-      
-      html2canvas(document.getElementById('receipt')).then(canvas => {
-        const a = document.createElement('a'); a.download = u+'.png'; a.href = canvas.toDataURL(); a.click();
-        setTimeout(()=> document.getElementById('userForm').submit(), 500);
-      });
-    }
-  </script>
-{% endif %}
-</body></html>"""
-
-app = Flask(__name__)
-app.secret_key = os.environ.get("WEB_SECRET","dev-key")
-ADMIN_U = os.environ.get("WEB_ADMIN_USER")
-ADMIN_P = os.environ.get("WEB_ADMIN_PASSWORD")
+</body>
+</html>
+"""
 
 def load_users():
+    if not os.path.exists(USERS_FILE): return []
     try:
-        with open(USERS_FILE,"r") as f: return json.load(f)
+        with open(USERS_FILE, 'r') as f:
+            users = json.load(f)
+            now = datetime.now()
+            for u in users:
+                u['is_expired'] = datetime.strptime(u['expires'], "%Y-%m-%d") < now
+            return users
     except: return []
 
-def save_and_sync(users):
-    with open(USERS_FILE,"w") as f: json.dump(users, f, indent=2)
-    # Sync to config.json
+def sync_config():
+    users = load_users()
+    # သက်တမ်းမကုန်သေးတဲ့ User password တွေပဲ config ထဲထည့်မယ်
+    now = datetime.now()
+    pws = [u['password'] for u in users if datetime.strptime(u['expires'], "%Y-%m-%d") >= now]
+    if not pws: pws = ["zi_placeholder"]
     try:
-        with open(CONFIG_FILE,"r") as f: cfg=json.load(f)
-        cfg["auth"]["config"] = [u["password"] for u in users]
-        with open(CONFIG_FILE,"w") as f: json.dump(cfg, f, indent=2)
-        subprocess.run("systemctl restart zivpn", shell=True)
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump({"listen":":5667","auth":{"mode":"passwords","config":pws},"obfs":"zivpn"}, f, indent=2)
+        subprocess.run(["systemctl", "restart", "zivpn"])
     except: pass
 
-@app.route("/")
+@app.route('/')
 def index():
-    if ADMIN_U and not session.get("auth"): return render_template_string(HTML, authed=False, logo=LOGO_URL)
-    return render_template_string(HTML, authed=True, logo=LOGO_URL, users=load_users())
+    if not session.get('auth'): return render_template_string(HTML_TPL, authed=False)
+    return render_template_string(HTML_TPL, authed=True, users=load_users())
 
-@app.route("/login", methods=["POST"])
+@app.route('/login', methods=['POST'])
 def login():
-    if request.form.get("u")==ADMIN_U and request.form.get("p")==ADMIN_P:
-        session["auth"]=True
-    return redirect(url_for("index"))
+    if request.form.get('u') == os.environ.get('WEB_ADMIN_USER') and \
+       request.form.get('p') == os.environ.get('WEB_ADMIN_PASSWORD'):
+        session['auth'] = True
+    return redirect(url_for('index'))
 
-@app.route("/logout")
-def logout(): session.clear(); return redirect(url_for("index"))
-
-@app.route("/add", methods=["POST"])
+@app.route('/add', methods=['POST'])
 def add():
-    u, p = request.form.get("user"), request.form.get("password")
-    exp = request.form.get("expires") or "30"
-    if exp.isdigit(): exp = (datetime.now()+timedelta(days=int(exp))).strftime("%Y-%m-%d")
-    users = load_users()
-    users.append({"user":u, "password":p, "expires":exp})
-    save_and_sync(users)
-    return redirect(url_for("index"))
+    if session.get('auth'):
+        users = load_users()
+        days = int(request.form.get('days') or 30)
+        exp = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
+        users.append({"user": request.form.get('user'), "password": request.form.get('pass'), "expires": exp})
+        with open(USERS_FILE, 'w') as f: json.dump(users, f, indent=2)
+        sync_config()
+    return redirect('/')
 
-@app.route("/delete", methods=["POST"])
+@app.route('/renew', methods=['POST'])
+def renew():
+    if session.get('auth'):
+        name = request.form.get('user')
+        add_days = int(request.form.get('renew_days') or 30)
+        users = load_users()
+        now = datetime.now()
+        for u in users:
+            if u['user'] == name:
+                cur_exp = datetime.strptime(u['expires'], "%Y-%m-%d")
+                # သက်တမ်းကုန်နေရင် ဒီနေ့ကစတိုး၊ မကုန်သေးရင် ရှိရင်းစွဲပေါ်ထပ်ပေါင်း
+                base_date = now if cur_exp < now else cur_exp
+                u['expires'] = (base_date + timedelta(days=add_days)).strftime("%Y-%m-%d")
+        with open(USERS_FILE, 'w') as f: json.dump(users, f, indent=2)
+        sync_config()
+    return redirect('/')
+
+@app.route('/delete', methods=['POST'])
 def delete():
-    u = request.form.get("user")
-    users = [user for user in load_users() if user["user"] != u]
-    save_and_sync(users)
-    return redirect(url_for("index"))
+    if session.get('auth'):
+        name = request.form.get('user')
+        users = [u for u in load_users() if u['user'] != name]
+        with open(USERS_FILE, 'w') as f: json.dump(users, f, indent=2)
+        sync_config()
+    return redirect('/')
+
+@app.route('/logout')
+def logout(): session.clear(); return redirect('/')
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8880)
 PY
 
-# ===== 5. Services Setup =====
-say "${Y}⚙️ Systemd services သတ်မှတ်နေသည်...${Z}"
-
-# ZIVPN Service
+# ===== Service Setup =====
 cat >/etc/systemd/system/zivpn.service <<EOF
 [Unit]
 Description=ZIVPN UDP Server
 After=network.target
-
 [Service]
 WorkingDirectory=/etc/zivpn
 ExecStart=$BIN server -c $CFG
 Restart=always
-RestartSec=3
-
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# Web Service
 cat >/etc/systemd/system/zivpn-web.service <<EOF
 [Unit]
 Description=ZIVPN Web Panel
-After=network.target
-
 [Service]
-EnvironmentFile=-$ENVF
+EnvironmentFile=$ENVF
 ExecStart=/usr/bin/python3 /etc/zivpn/web.py
 Restart=always
-RestartSec=3
-
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# ===== 6. Networking & Firewall =====
-say "${Y}🌐 Networking rules များ သတ်မှတ်နေသည်...${Z}"
+# Networking
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
-echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf || true
-
 IFACE=$(ip -4 route ls | awk '/default/ {print $5; exit}')
+iptables -t nat -F
 iptables -t nat -A PREROUTING -i "$IFACE" -p udp --dport 6000:19999 -j DNAT --to-destination :5667
 iptables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE
 
-ufw allow 5667/udp && ufw allow 6000:19999/udp && ufw allow 8880/tcp || true
+# Firewall
+ufw allow 5667/udp && ufw allow 6000:19999/udp && ufw allow 8880/tcp && ufw --force enable
 
-# ===== 7. Finalize =====
 systemctl daemon-reload
-systemctl enable --now zivpn.service zivpn-web.service
+systemctl enable --now zivpn zivpn-web
 
 IP=$(hostname -I | awk '{print $1}')
-echo -e "\n$LINE\n${G}VPS-IP-COPYလုပ်ပါ${Z}"
-echo -e "${C}ဘာကြည့်နေတာလဲ    :${Z} ${Y}http://$IP:8880${Z}"
-echo -e "${C}ရပါပြီဆို  :${Z} ${Y}/etc/zivpn/users.json${Z}"
-echo -e "${C}မယုံရင် :${Z} ${Y}/etc/zivpn/config.json${Z}"
-echo -e "${C}လော့အင်ကြည့်ကွာ    :${Z} ${Y}systemctl status|restart zivpn  •  systemctl status|restart zivpn-web${Z}"
+echo -e "\n$LINE\n${G}✅ အကုန်ပြင်ပေးပြီးပါပြီ!${Z}"
+echo -e "${C}Web Panel Link :${Z} ${Y}http://$IP:8880${Z}"
+echo -e "${C}Features       :${Z} Manual Renew (ရက်ပေါင်းစိတ်ကြိုက်ရိုက်ထည့်ယူရန်)"
 echo -e "$LINE"
